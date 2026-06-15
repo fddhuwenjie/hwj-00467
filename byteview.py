@@ -1706,7 +1706,7 @@ class CallGraph:
         isolated = []
         for name in self.node_names:
             node = self.nodes[name]
-            if node["in_degree"] == 0 and not name.startswith("<module>"):
+            if node["in_degree"] == 0 and name != "<module>":
                 isolated.append(name)
         return isolated
 
