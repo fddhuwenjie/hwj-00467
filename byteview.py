@@ -2,6 +2,7 @@
 """ByteView - Python Bytecode Disassembler and Control Flow Graph Generator."""
 
 import argparse
+import ast
 import dis
 import json
 import os
@@ -800,8 +801,8 @@ def format_dataflow_results(results, blocks, use_color=True):
 
 # ========== Optimization Suggestions ==========
 
-def analyze_optimizations(blocks, edges, instructions, code_obj):
-    """Detect optimization opportunities."""
+def analyze_optimizations(blocks, edges, instructions, code_obj, dataflow_results=None):
+    """Detect optimization opportunities, integrating dataflow analysis results."""
     suggestions = []
 
     reachable = set()
@@ -828,6 +829,37 @@ def analyze_optimizations(blocks, edges, instructions, code_obj):
                 "line": first_instr["line"] if first_instr else None,
                 "description": f"Dead code: basic block BB{block.id} is unreachable",
                 "suggestion": "Consider removing unreachable code or fixing control flow",
+                "removable": True,
+            })
+
+    if dataflow_results:
+        for uv in dataflow_results.get("unused_vars", []):
+            suggestions.append({
+                "type": "unused_assignment",
+                "severity": "warning",
+                "variable": uv["variable"],
+                "offset": uv["offset"],
+                "line": uv["line"],
+                "start_offset": uv["offset"],
+                "end_offset": uv["offset"],
+                "description": f"Unused assignment to variable '{uv['variable']}' at offset {uv['offset']}",
+                "suggestion": f"Remove the unused assignment to '{uv['variable']}'",
+                "removable": True,
+            })
+
+        for mi in dataflow_results.get("maybe_uninitialized", []):
+            suggestions.append({
+                "type": "maybe_uninitialized",
+                "severity": "error",
+                "variable": mi["variable"],
+                "offset": mi["offset"],
+                "line": mi["line"],
+                "block": mi["block"],
+                "start_offset": mi["offset"],
+                "end_offset": mi["offset"],
+                "description": f"Variable '{mi['variable']}' may be uninitialized at offset {mi['offset']}",
+                "suggestion": f"Ensure '{mi['variable']}' is initialized before use, or add a default value",
+                "removable": False,
             })
 
     for i in range(len(instructions) - 1):
@@ -839,8 +871,11 @@ def analyze_optimizations(blocks, edges, instructions, code_obj):
                 "severity": "info",
                 "offset": curr["offset"],
                 "line": curr["line"],
+                "start_offset": curr["offset"],
+                "end_offset": nxt["offset"],
                 "description": f"Redundant LOAD_FAST + POP_TOP at offset {curr['offset']}",
                 "suggestion": "The loaded value is immediately discarded; consider removing",
+                "removable": True,
             })
         if curr["opname"] == "LOAD_CONST" and nxt["opname"] == "POP_TOP":
             suggestions.append({
@@ -848,27 +883,58 @@ def analyze_optimizations(blocks, edges, instructions, code_obj):
                 "severity": "info",
                 "offset": curr["offset"],
                 "line": curr["line"],
+                "start_offset": curr["offset"],
+                "end_offset": nxt["offset"],
                 "description": f"Redundant LOAD_CONST + POP_TOP at offset {curr['offset']}",
                 "suggestion": "The constant is immediately discarded; consider removing",
+                "removable": True,
             })
 
     for block in blocks:
         for i, instr in enumerate(block.instructions):
             if instr["opname"] == "LOAD_CONST" and instr["arg"] is not None:
-                const_val = instr["argval"]
+                const_val1 = instr["argval"]
                 if i + 1 < len(block.instructions):
                     next_instr = block.instructions[i + 1]
                     if next_instr["opname"] == "LOAD_CONST":
+                        const_val2 = next_instr["argval"]
                         if i + 2 < len(block.instructions):
                             third = block.instructions[i + 2]
                             if third["opname"] in BINARY_OPS:
+                                folded_value = None
+                                try:
+                                    if third["opname"] == "BINARY_OP":
+                                        op_type = third["argval"]
+                                        if isinstance(op_type, str):
+                                            if op_type == "+":
+                                                folded_value = const_val1 + const_val2
+                                            elif op_type == "-":
+                                                folded_value = const_val1 - const_val2
+                                            elif op_type == "*":
+                                                folded_value = const_val1 * const_val2
+                                            elif op_type == "/":
+                                                folded_value = const_val1 / const_val2
+                                            elif op_type == "**":
+                                                folded_value = const_val1 ** const_val2
+                                            elif op_type == "//":
+                                                folded_value = const_val1 // const_val2
+                                            elif op_type == "%":
+                                                folded_value = const_val1 % const_val2
+                                except Exception:
+                                    pass
                                 suggestions.append({
                                     "type": "constant_folding",
                                     "severity": "info",
                                     "offset": instr["offset"],
                                     "line": instr["line"],
+                                    "start_offset": instr["offset"],
+                                    "end_offset": third["offset"],
                                     "description": f"Constant expression at offset {instr['offset']} can be folded",
                                     "suggestion": "Two constants followed by binary operation can be pre-computed",
+                                    "removable": True,
+                                    "folded_value": folded_value,
+                                    "const1": const_val1,
+                                    "const2": const_val2,
                                 })
 
     for block in blocks:
@@ -882,8 +948,11 @@ def analyze_optimizations(blocks, edges, instructions, code_obj):
                         "severity": "info",
                         "offset": instr["offset"],
                         "line": instr["line"],
+                        "start_offset": instr["offset"],
+                        "end_offset": instr["offset"],
                         "description": f"Trivial jump at offset {instr['offset']} jumps to next instruction",
                         "suggestion": "Consider removing the redundant jump",
+                        "removable": True,
                     })
 
     suggestions.sort(key=lambda s: s.get("start_offset", s.get("offset", 0)))
@@ -917,6 +986,1109 @@ def format_optimizations(suggestions, use_color=True):
         lines.append("")
 
     return "\n".join(lines)
+
+
+# ========== Source Code Rewriting ==========
+
+class OptimizationRewriter(ast.NodeTransformer):
+    """AST transformer that applies optimizations based on analysis results."""
+
+    def __init__(self, unused_vars=None, constant_folds=None, dead_code_lines=None, source_lines=None):
+        self.unused_vars = unused_vars or []
+        self.constant_folds = constant_folds or []
+        self.dead_code_lines = dead_code_lines or set()
+        self.source_lines = source_lines or []
+        self.removed_lines = set()
+        self.modified_assignments = {}
+
+    def visit_Assign(self, node):
+        self.generic_visit(node)
+        if isinstance(node.targets[0], ast.Name):
+            var_name = node.targets[0].id
+            for uv in self.unused_vars:
+                if uv["variable"] == var_name and uv["line"] == node.lineno:
+                    self.removed_lines.add(node.lineno)
+                    return None
+        return node
+
+    def visit_Expr(self, node):
+        self.generic_visit(node)
+        if node.lineno in self.dead_code_lines:
+            self.removed_lines.add(node.lineno)
+            return None
+        if isinstance(node.value, ast.Constant):
+            for uv in self.unused_vars:
+                if uv["line"] == node.lineno and uv["type"] == "unused_assignment":
+                    pass
+        return node
+
+    def visit_BinOp(self, node):
+        self.generic_visit(node)
+        if isinstance(node.left, ast.Constant) and isinstance(node.right, ast.Constant):
+            left_val = node.left.value
+            right_val = node.right.value
+            try:
+                if isinstance(node.op, ast.Add):
+                    result = left_val + right_val
+                elif isinstance(node.op, ast.Sub):
+                    result = left_val - right_val
+                elif isinstance(node.op, ast.Mult):
+                    result = left_val * right_val
+                elif isinstance(node.op, ast.Div):
+                    result = left_val / right_val
+                elif isinstance(node.op, ast.FloorDiv):
+                    result = left_val // right_val
+                elif isinstance(node.op, ast.Mod):
+                    result = left_val % right_val
+                elif isinstance(node.op, ast.Pow):
+                    result = left_val ** right_val
+                else:
+                    return node
+                return ast.Constant(value=result, lineno=node.lineno, col_offset=node.col_offset)
+            except Exception:
+                pass
+        return node
+
+    def visit_If(self, node):
+        self.generic_visit(node)
+        if isinstance(node.test, ast.Constant):
+            if node.test.value is True:
+                return node.body
+            elif node.test.value is False:
+                return node.orelse if node.orelse else None
+        return node
+
+    def visit_While(self, node):
+        self.generic_visit(node)
+        if isinstance(node.test, ast.Constant) and node.test.value is False:
+            return None
+        return node
+
+
+def apply_ast_rewrites(source, unused_vars=None, constant_folds=None, dead_code_lines=None):
+    """Apply AST-based optimizations to source code."""
+    try:
+        tree = ast.parse(source)
+        source_lines = source.splitlines()
+        rewriter = OptimizationRewriter(
+            unused_vars=unused_vars,
+            constant_folds=constant_folds,
+            dead_code_lines=dead_code_lines,
+            source_lines=source_lines
+        )
+        new_tree = rewriter.visit(tree)
+        ast.fix_missing_locations(new_tree)
+        return ast.unparse(new_tree), rewriter.removed_lines
+    except Exception as e:
+        print(f"Warning: AST rewriting failed: {e}", file=sys.stderr)
+        return source, set()
+
+
+def collect_rewrite_info(optimizations):
+    """Collect rewrite information from optimization suggestions."""
+    unused_vars = []
+    constant_folds = []
+    dead_code_offsets = set()
+    dead_code_blocks = set()
+
+    for opt in optimizations:
+        if opt.get("removable", False):
+            if opt["type"] == "unused_assignment":
+                unused_vars.append(opt)
+            elif opt["type"] == "constant_folding":
+                constant_folds.append(opt)
+            elif opt["type"] == "dead_code":
+                dead_code_blocks.add(opt.get("block"))
+                dead_code_offsets.add(opt.get("start_offset"))
+
+    return {
+        "unused_vars": unused_vars,
+        "constant_folds": constant_folds,
+        "dead_code_offsets": dead_code_offsets,
+        "dead_code_blocks": dead_code_blocks,
+    }
+
+
+def find_dead_code_lines(blocks, dead_code_blocks, instructions):
+    """Find line numbers of dead code blocks."""
+    dead_lines = set()
+    for block in blocks:
+        if block.id in dead_code_blocks:
+            for instr in block.instructions:
+                if instr.get("line"):
+                    dead_lines.add(instr["line"])
+    return dead_lines
+
+
+def rewrite_source(source_path, optimizations, blocks, instructions):
+    """Rewrite source code applying optimizations."""
+    with open(source_path, "r", encoding="utf-8") as f:
+        source = f.read()
+
+    rewrite_info = collect_rewrite_info(optimizations)
+    dead_code_lines = find_dead_code_lines(blocks, rewrite_info["dead_code_blocks"], instructions)
+
+    optimized_source, removed_lines = apply_ast_rewrites(
+        source,
+        unused_vars=rewrite_info["unused_vars"],
+        constant_folds=rewrite_info["constant_folds"],
+        dead_code_lines=dead_code_lines
+    )
+
+    return optimized_source, {
+        "removed_lines": removed_lines,
+        "unused_vars_removed": len(rewrite_info["unused_vars"]),
+        "constants_folded": len(rewrite_info["constant_folds"]),
+        "dead_blocks_removed": len(rewrite_info["dead_code_blocks"]),
+    }
+
+
+def count_bytecode_instructions(code_obj):
+    """Count the number of bytecode instructions in a code object (recursively)."""
+    count = len(get_instructions(code_obj))
+    for const in code_obj.co_consts:
+        if isinstance(const, CodeType):
+            count += count_bytecode_instructions(const)
+    return count
+
+
+def cmd_rewrite(args):
+    """Handle 'rewrite' command."""
+    use_color = not args.no_color
+
+    try:
+        code_obj = compile_source(args.source)
+    except SyntaxError as e:
+        print(f"Error: Failed to compile {args.source}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    all_codes = get_all_code_objects(code_obj)
+
+    if args.function:
+        name, co = find_function(code_obj, args.function)
+        if co is None:
+            print(f"Error: Function '{args.function}' not found", file=sys.stderr)
+            sys.exit(1)
+        codes_to_process = [(name, co)]
+    else:
+        codes_to_process = all_codes
+
+    all_optimizations = []
+    all_blocks = []
+    all_instructions = []
+    all_dataflow = []
+
+    original_instr_count = count_bytecode_instructions(code_obj)
+
+    for name, co in codes_to_process:
+        instructions = get_instructions(co)
+        blocks = build_basic_blocks(instructions)
+        edges = build_cfg_edges(blocks)
+        dataflow_results = analyze_dataflow(blocks, edges, co)
+        optimizations = analyze_optimizations(blocks, edges, instructions, co, dataflow_results)
+
+        all_optimizations.extend(optimizations)
+        all_blocks.extend(blocks)
+        all_instructions.extend(instructions)
+        all_dataflow.append(dataflow_results)
+
+    if not all_optimizations:
+        print(Colors.colorize("No optimizations to apply.", Colors.GREEN, use_color))
+        return
+
+    print(Colors.colorize("=== Optimization Summary ===", Colors.BOLD + Colors.CYAN, use_color))
+    print()
+    removable = [o for o in all_optimizations if o.get("removable", False)]
+    print(f"Total optimization suggestions: {len(all_optimizations)}")
+    print(f"Automatically applicable: {len(removable)}")
+    print()
+
+    for i, opt in enumerate(removable, 1):
+        print(f"  [{i}] {opt['type']}: {opt['description']}")
+    print()
+
+    optimized_source, stats = rewrite_source(args.source, all_optimizations, all_blocks, all_instructions)
+
+    output_path = args.output or (os.path.splitext(args.source)[0] + "_optimized.py")
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(optimized_source)
+
+    print(Colors.colorize(f"Optimized source written to: {output_path}", Colors.GREEN, use_color))
+    print()
+
+    print(Colors.colorize("=== Rewrite Statistics ===", Colors.BOLD + Colors.CYAN, use_color))
+    print()
+    print(f"  Unused variable assignments removed: {stats['unused_vars_removed']}")
+    print(f"  Constant expressions folded: {stats['constants_folded']}")
+    print(f"  Dead code blocks removed: {stats['dead_blocks_removed']}")
+    print(f"  Source lines removed: {len(stats['removed_lines'])}")
+    print()
+
+    try:
+        optimized_code = compile(optimized_source, output_path, "exec")
+        optimized_instr_count = count_bytecode_instructions(optimized_code)
+
+        print(Colors.colorize("=== Bytecode Comparison ===", Colors.BOLD + Colors.CYAN, use_color))
+        print()
+        print(f"  Original instructions: {original_instr_count}")
+        print(f"  Optimized instructions: {optimized_instr_count}")
+        reduction = original_instr_count - optimized_instr_count
+        reduction_pct = (reduction / original_instr_count * 100) if original_instr_count > 0 else 0
+        if reduction > 0:
+            print(Colors.colorize(f"  Reduction: {reduction} instructions ({reduction_pct:.1f}%)",
+                                  Colors.GREEN, use_color))
+        elif reduction < 0:
+            print(Colors.colorize(f"  Increase: {-reduction} instructions", Colors.RED, use_color))
+        else:
+            print("  No change in instruction count")
+        print()
+    except SyntaxError as e:
+        print(Colors.colorize(f"Warning: Could not compile optimized source for comparison: {e}",
+                              Colors.YELLOW, use_color))
+
+    if args.json:
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump({
+                "original_file": args.source,
+                "optimized_file": output_path,
+                "original_instructions": original_instr_count,
+                "stats": stats,
+                "optimizations_applied": removable,
+            }, f, indent=2, default=str)
+        print(f"JSON report written to: {args.json}")
+
+
+# ========== Complexity Analysis ==========
+
+class LoopInfo:
+    """Information about a loop structure."""
+    def __init__(self, loop_type, start_offset, header_block, body_blocks, exit_block, nesting_level=0):
+        self.loop_type = loop_type
+        self.start_offset = start_offset
+        self.header_block = header_block
+        self.body_blocks = body_blocks
+        self.exit_block = exit_block
+        self.nesting_level = nesting_level
+        self.instruction_count = 0
+
+
+def detect_loops(blocks, edges):
+    """Detect loop structures in the CFG using back edges."""
+    loops = []
+
+    edge_map = {}
+    for src, dst, kind in edges:
+        if src.id not in edge_map:
+            edge_map[src.id] = []
+        edge_map[src.id].append((dst, kind))
+
+    def dfs(current, visited, path):
+        visited.add(current.id)
+        path.append(current.id)
+
+        for dst, kind in edge_map.get(current.id, []):
+            if dst.id in path:
+                loop_start_idx = path.index(dst.id)
+                loop_blocks_ids = path[loop_start_idx:]
+                loop_body_blocks = [b for b in blocks if b.id in loop_blocks_ids]
+                exit_block = None
+                for b in loop_body_blocks:
+                    for out_dst, out_kind in edge_map.get(b.id, []):
+                        if out_dst.id not in loop_blocks_ids:
+                            exit_block = out_dst
+                            break
+                    if exit_block:
+                        break
+
+                loop_type = "for" if any(
+                    any(i["opname"] == "FOR_ITER" for i in b.instructions)
+                    for b in loop_body_blocks
+                ) else "while"
+
+                header_block = [b for b in blocks if b.id == loop_blocks_ids[0]][0]
+                loops.append(LoopInfo(
+                    loop_type=loop_type,
+                    start_offset=header_block.start_offset,
+                    header_block=header_block,
+                    body_blocks=loop_body_blocks,
+                    exit_block=exit_block,
+                ))
+            elif dst.id not in visited:
+                dfs(dst, visited, path)
+
+        path.pop()
+
+    if blocks:
+        dfs(blocks[0], set(), [])
+
+    visited_loops = set()
+    unique_loops = []
+    for loop in loops:
+        key = tuple(sorted(b.id for b in loop.body_blocks))
+        if key not in visited_loops:
+            visited_loops.add(key)
+            unique_loops.append(loop)
+
+    block_to_loops = {}
+    for loop in unique_loops:
+        for block in loop.body_blocks:
+            if block.id not in block_to_loops:
+                block_to_loops[block.id] = []
+            block_to_loops[block.id].append(loop)
+
+    for loop in unique_loops:
+        max_nesting = 0
+        for block in loop.body_blocks:
+            nesting = len(block_to_loops.get(block.id, []))
+            if nesting > max_nesting:
+                max_nesting = nesting
+        loop.nesting_level = max_nesting
+
+        total_instr = 0
+        for block in loop.body_blocks:
+            total_instr += len(block.instructions)
+        loop.instruction_count = total_instr
+
+    return unique_loops
+
+
+def compute_cyclomatic_complexity(blocks, edges):
+    """Compute cyclomatic complexity: E - N + 2P, simplified to conditional_branches + 1."""
+    conditional_edges = sum(1 for _, _, kind in edges if kind == "conditional")
+    return conditional_edges + 1
+
+
+def compute_max_nesting_depth(loops):
+    """Compute maximum nesting depth from loops."""
+    if not loops:
+        return 0
+    return max(loop.nesting_level for loop in loops)
+
+
+def analyze_hot_paths(blocks, edges, instructions, loops):
+    """Analyze hot paths - blocks inside loops."""
+    loop_block_ids = set()
+    for loop in loops:
+        for block in loop.body_blocks:
+            loop_block_ids.add(block.id)
+
+    total_instructions = len(instructions)
+    loop_instructions = sum(
+        len(block.instructions) for block in blocks if block.id in loop_block_ids
+    )
+
+    hot_blocks = []
+    for block in blocks:
+        if block.id in loop_block_ids:
+            hot_blocks.append({
+                "block": block.id,
+                "instruction_count": len(block.instructions),
+                "start_offset": block.start_offset,
+                "end_offset": block.end_offset,
+            })
+
+    return {
+        "total_instructions": total_instructions,
+        "loop_instructions": loop_instructions,
+        "loop_ratio": (loop_instructions / total_instructions) if total_instructions > 0 else 0,
+        "hot_blocks": hot_blocks,
+    }
+
+
+def analyze_function_complexity(name, code_obj):
+    """Analyze complexity for a single function."""
+    instructions = get_instructions(code_obj)
+    blocks = build_basic_blocks(instructions)
+    edges = build_cfg_edges(blocks)
+
+    loops = detect_loops(blocks, edges)
+    cyclomatic = compute_cyclomatic_complexity(blocks, edges)
+    max_nesting = compute_max_nesting_depth(loops)
+    hot_paths = analyze_hot_paths(blocks, edges, instructions, loops)
+
+    return {
+        "name": name,
+        "function_name": code_obj.co_name,
+        "instructions": len(instructions),
+        "basic_blocks": len(blocks),
+        "loops": loops,
+        "loop_count": len(loops),
+        "cyclomatic_complexity": cyclomatic,
+        "max_nesting_depth": max_nesting,
+        "hot_paths": hot_paths,
+        "blocks": blocks,
+        "edges": edges,
+    }
+
+
+def format_complexity_report(all_complexities, use_color=True):
+    """Format complexity analysis report."""
+    lines = []
+    lines.append(Colors.colorize("=== Complexity Analysis Report ===", Colors.BOLD + Colors.CYAN, use_color))
+    lines.append("")
+
+    sorted_complexities = sorted(
+        all_complexities,
+        key=lambda x: x["cyclomatic_complexity"],
+        reverse=True
+    )
+
+    lines.append(Colors.colorize("Function Complexity Ranking (by Cyclomatic Complexity):", Colors.BOLD, use_color))
+    lines.append("")
+
+    header = f"{'Rank':<6}{'Function':<30}{'CC':<6}{'Loops':<8}{'Nesting':<10}{'Instr':<10}"
+    lines.append(Colors.colorize(header, Colors.BOLD + Colors.YELLOW, use_color))
+    lines.append("-" * 70)
+
+    for rank, comp in enumerate(sorted_complexities, 1):
+        name = comp["name"]
+        if len(name) > 28:
+            name = name[:25] + "..."
+        cc = comp["cyclomatic_complexity"]
+        lc = comp["loop_count"]
+        nd = comp["max_nesting_depth"]
+        instr = comp["instructions"]
+
+        cc_color = Colors.GREEN
+        if cc > 10:
+            cc_color = Colors.RED
+        elif cc > 5:
+            cc_color = Colors.YELLOW
+
+        line = f"{rank:<6}{name:<30}"
+        line += Colors.colorize(f"{cc:<6}", cc_color, use_color)
+        line += f"{lc:<8}{nd:<10}{instr:<10}"
+        lines.append(line)
+
+    lines.append("")
+    lines.append(Colors.colorize("Cyclomatic Complexity Guide:", Colors.DIM, use_color))
+    lines.append(Colors.colorize("  1-5: Low complexity", Colors.GREEN, use_color))
+    lines.append(Colors.colorize("  6-10: Moderate complexity", Colors.YELLOW, use_color))
+    lines.append(Colors.colorize("  >10: High complexity - consider refactoring", Colors.RED, use_color))
+    lines.append("")
+
+    for comp in sorted_complexities:
+        if comp["loops"]:
+            lines.append(Colors.colorize(f"=== {comp['name']} Loop Details ===", Colors.BOLD + Colors.CYAN, use_color))
+            lines.append("")
+
+            for i, loop in enumerate(comp["loops"], 1):
+                loop_type_str = "for" if loop.loop_type == "for" else "while"
+                lines.append(f"  Loop {i}: {loop_type_str} loop at offset {loop.start_offset}")
+                lines.append(f"    Type: {loop_type_str}")
+                lines.append(f"    Nesting level: {loop.nesting_level}")
+                lines.append(f"    Body blocks: {[b.label for b in loop.body_blocks]}")
+                lines.append(f"    Instructions in loop: {loop.instruction_count}")
+                lines.append(f"    Header block: {loop.header_block.label}")
+                if loop.exit_block:
+                    lines.append(f"    Exit to: {loop.exit_block.label}")
+                lines.append("")
+
+            hp = comp["hot_paths"]
+            lines.append(f"  Hot Path Analysis:")
+            lines.append(f"    Total instructions: {hp['total_instructions']}")
+            lines.append(f"    Loop instructions: {hp['loop_instructions']}")
+            ratio_pct = hp['loop_ratio'] * 100
+            ratio_color = Colors.GREEN
+            if ratio_pct > 50:
+                ratio_color = Colors.RED
+            elif ratio_pct > 20:
+                ratio_color = Colors.YELLOW
+            lines.append(Colors.colorize(
+                f"    Loop ratio: {ratio_pct:.1f}%",
+                ratio_color, use_color))
+
+            if hp["hot_blocks"]:
+                lines.append(f"    Hot blocks (in loops):")
+                for hb in hp["hot_blocks"]:
+                    lines.append(f"      {hb['block']:>4} ({hb['instruction_count']} instructions)")
+            lines.append("")
+
+    return "\n".join(lines)
+
+
+def cmd_complexity(args):
+    """Handle 'complexity' command."""
+    use_color = not args.no_color
+
+    try:
+        code_obj = compile_source(args.source)
+    except SyntaxError as e:
+        print(f"Error: Failed to compile {args.source}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    all_codes = get_all_code_objects(code_obj)
+
+    if args.function:
+        name, co = find_function(code_obj, args.function)
+        if co is None:
+            print(f"Error: Function '{args.function}' not found", file=sys.stderr)
+            sys.exit(1)
+        codes_to_process = [(name, co)]
+    else:
+        codes_to_process = all_codes
+
+    all_complexities = []
+
+    for name, co in codes_to_process:
+        if co.co_name == "<module>" and not args.function:
+            continue
+        complexity = analyze_function_complexity(name, co)
+        all_complexities.append(complexity)
+
+    if not all_complexities:
+        print(Colors.colorize("No functions to analyze.", Colors.YELLOW, use_color))
+        return
+
+    print(format_complexity_report(all_complexities, use_color))
+
+    if args.json:
+        json_data = []
+        for comp in all_complexities:
+            loops_data = []
+            for loop in comp["loops"]:
+                loops_data.append({
+                    "type": loop.loop_type,
+                    "start_offset": loop.start_offset,
+                    "nesting_level": loop.nesting_level,
+                    "body_blocks": [b.id for b in loop.body_blocks],
+                    "instruction_count": loop.instruction_count,
+                    "header_block": loop.header_block.id,
+                    "exit_block": loop.exit_block.id if loop.exit_block else None,
+                })
+
+            json_data.append({
+                "name": comp["name"],
+                "function_name": comp["function_name"],
+                "instructions": comp["instructions"],
+                "basic_blocks": comp["basic_blocks"],
+                "loop_count": comp["loop_count"],
+                "cyclomatic_complexity": comp["cyclomatic_complexity"],
+                "max_nesting_depth": comp["max_nesting_depth"],
+                "loops": loops_data,
+                "hot_paths": comp["hot_paths"],
+            })
+
+        output = {"functions": json_data} if len(json_data) > 1 else json_data[0]
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump(output, f, indent=2, default=str)
+        print(f"JSON report written to: {args.json}")
+
+
+# ========== Call Graph Analysis ==========
+
+class CallGraph:
+    """Represents a function call graph."""
+
+    def __init__(self):
+        self.nodes = {}
+        self.edges = []
+        self.node_names = []
+
+    def add_node(self, name, code_obj=None):
+        """Add a function node to the graph."""
+        if name not in self.nodes:
+            self.nodes[name] = {
+                "name": name,
+                "code_obj": code_obj,
+                "calls": [],
+                "called_by": [],
+                "call_count": 0,
+                "in_degree": 0,
+                "out_degree": 0,
+            }
+            self.node_names.append(name)
+
+    def add_edge(self, caller, callee, offset=None, line=None):
+        """Add a call edge from caller to callee (with deduplication)."""
+        self.add_node(caller)
+        self.add_node(callee)
+
+        for existing in self.edges:
+            if existing["caller"] == caller and existing["callee"] == callee:
+                return
+
+        self.edges.append({
+            "caller": caller,
+            "callee": callee,
+            "offset": offset,
+            "line": line,
+        })
+
+        self.nodes[caller]["calls"].append({
+            "callee": callee,
+            "offset": offset,
+            "line": line,
+        })
+        self.nodes[caller]["out_degree"] += 1
+        self.nodes[caller]["call_count"] += 1
+
+        self.nodes[callee]["called_by"].append({
+            "caller": caller,
+            "offset": offset,
+            "line": line,
+        })
+        self.nodes[callee]["in_degree"] += 1
+
+    def get_recursive_calls(self):
+        """Find all recursive calls (direct and indirect)."""
+        direct_recursion = []
+        indirect_recursion = []
+        direct_self_callers = set()
+
+        for caller, callee_list in [(n, self.nodes[n]["calls"]) for n in self.nodes]:
+            for call in callee_list:
+                if call["callee"] == caller:
+                    direct_recursion.append({
+                        "function": caller,
+                        "offset": call["offset"],
+                        "line": call["line"],
+                    })
+                    direct_self_callers.add(caller)
+
+        cycles = self._find_cycles()
+        seen_cycles = set()
+        for cycle in cycles:
+            unique_nodes = set(cycle[:-1])
+            if len(unique_nodes) > 1:
+                cycle_key = tuple(sorted(unique_nodes))
+                if cycle_key not in seen_cycles:
+                    seen_cycles.add(cycle_key)
+                    indirect_recursion.append({
+                        "cycle": cycle,
+                        "length": len(unique_nodes),
+                    })
+
+        return {
+            "direct": direct_recursion,
+            "indirect": indirect_recursion,
+        }
+
+    def _find_cycles(self):
+        """Find all cycles in the call graph using DFS."""
+        cycles = []
+        visited = set()
+        path = []
+
+        def dfs(node):
+            if node in path:
+                cycle_start = path.index(node)
+                cycle = path[cycle_start:] + [node]
+                cycles.append(cycle)
+                return
+            if node in visited:
+                return
+
+            visited.add(node)
+            path.append(node)
+
+            for call in self.nodes[node]["calls"]:
+                dfs(call["callee"])
+
+            path.pop()
+
+        for node in self.node_names:
+            if node not in visited:
+                dfs(node)
+
+        unique_cycles = []
+        seen = set()
+        for cycle in cycles:
+            normalized = tuple(sorted(cycle[:-1]))
+            if normalized not in seen:
+                seen.add(normalized)
+                unique_cycles.append(cycle)
+
+        return unique_cycles
+
+    def get_isolated_functions(self):
+        """Find functions that are never called by any other function."""
+        isolated = []
+        for name in self.node_names:
+            node = self.nodes[name]
+            if node["in_degree"] == 0 and not name.startswith("<module>"):
+                isolated.append(name)
+        return isolated
+
+    def get_reachable_subgraph(self, root):
+        """Get all nodes reachable from root."""
+        if root not in self.nodes:
+            return set()
+
+        reachable = set()
+        stack = [root]
+
+        while stack:
+            node = stack.pop()
+            if node in reachable:
+                continue
+            reachable.add(node)
+            for call in self.nodes[node]["calls"]:
+                if call["callee"] not in reachable:
+                    stack.append(call["callee"])
+
+        return reachable
+
+    def get_edges_for_subgraph(self, node_set):
+        """Get edges where both endpoints are in node_set."""
+        return [
+            e for e in self.edges
+            if e["caller"] in node_set and e["callee"] in node_set
+        ]
+
+
+def build_call_graph(code_obj):
+    """Build a call graph by scanning CALL instructions in all code objects."""
+    graph = CallGraph()
+    all_codes = get_all_code_objects(code_obj)
+
+    for name, co in all_codes:
+        graph.add_node(name, co)
+
+    function_name_map = {}
+    for name, co in all_codes:
+        short_name = co.co_name
+        if short_name not in function_name_map:
+            function_name_map[short_name] = []
+        function_name_map[short_name].append(name)
+
+    def find_callee_name(instructions, call_idx):
+        """Find the callee name by simulating stack backward from the CALL instruction."""
+        call_instr = instructions[call_idx]
+        num_args = call_instr.get("arg", 1) or 1
+        stack_depth = num_args + 1
+
+        for i in range(call_idx - 1, max(-1, call_idx - 50), -1):
+            if i < 0:
+                break
+            instr = instructions[i]
+            opname = instr["opname"]
+            arg = instr.get("arg")
+            argval = instr.get("argval")
+            argrepr = instr.get("argrepr")
+
+            effect = compute_stack_effect(opname, arg)
+
+            if effect > 0:
+                stack_depth -= effect
+                if stack_depth <= 0:
+                    if opname == "LOAD_GLOBAL":
+                        if isinstance(argval, tuple) and len(argval) > 0:
+                            name = argval[0]
+                            if isinstance(name, str):
+                                return name
+                        if isinstance(argrepr, str):
+                            if " + " in argrepr:
+                                return argrepr.split(" + ")[0]
+                            return argrepr
+                    elif opname == "LOAD_ATTR":
+                        if isinstance(argval, str):
+                            return argval
+                        if isinstance(argrepr, str):
+                            return argrepr
+                    elif opname == "LOAD_METHOD":
+                        if isinstance(argval, str):
+                            return argval
+                        if isinstance(argrepr, str):
+                            return argrepr
+                    elif opname == "LOAD_NAME":
+                        if isinstance(argval, str):
+                            return argval
+                        if isinstance(argrepr, str):
+                            return argrepr
+                    elif opname in ("LOAD_FAST", "LOAD_FAST_BORROW"):
+                        if isinstance(argval, str):
+                            return argval
+                        if isinstance(argrepr, str):
+                            return argrepr
+                    else:
+                        return None
+            elif effect < 0:
+                stack_depth -= effect
+
+            if opname in CALL_OPS and stack_depth > 0:
+                break
+
+        return None
+
+    BUILTIN_FUNCTIONS = {
+        "print", "range", "len", "str", "int", "float", "bool", "list", "dict", "set", "tuple",
+        "isinstance", "type",
+        "append", "extend", "pop", "insert", "remove", "clear", "sort", "reverse", "index", "count",
+        "format", "join", "split", "strip", "upper", "lower", "replace", "find", "startswith", "endswith",
+        "open", "close", "read", "write", "readline", "readlines",
+        "getattr", "setattr", "hasattr", "issubclass",
+        "abs", "min", "max", "sum", "sorted", "reversed", "enumerate", "zip", "map", "filter", "reduce",
+        "any", "all",
+    }
+
+    def resolve_callee(callee_name, caller_name):
+        """Resolve a callee name to a fully qualified function name."""
+        if not callee_name:
+            return None
+
+        if callee_name.startswith("__") and callee_name.endswith("__"):
+            if callee_name in function_name_map:
+                if len(function_name_map[callee_name]) == 1:
+                    return function_name_map[callee_name][0]
+            return None
+
+        if callee_name in function_name_map:
+            if len(function_name_map[callee_name]) == 1:
+                return function_name_map[callee_name][0]
+            else:
+                prefix = ".".join(caller_name.split(".")[:-1]) if "." in caller_name else ""
+                matching = [
+                    n for n in function_name_map[callee_name]
+                    if n.endswith("." + callee_name) or n == callee_name
+                ]
+                if len(matching) == 1:
+                    return matching[0]
+                if prefix:
+                    prefixed = prefix + "." + callee_name
+                    if prefixed in function_name_map.get(callee_name, []):
+                        return prefixed
+                return function_name_map[callee_name][0]
+        elif callee_name in BUILTIN_FUNCTIONS:
+            return callee_name
+        return None
+
+    for caller_name, co in all_codes:
+        instructions = get_instructions(co)
+
+        for idx, instr in enumerate(instructions):
+            if instr["opname"] in CALL_OPS:
+                callee_name = find_callee_name(instructions, idx)
+                if callee_name:
+                    actual_callee = resolve_callee(callee_name, caller_name)
+                    if actual_callee:
+                        graph.add_edge(
+                            caller_name,
+                            actual_callee,
+                            offset=instr["offset"],
+                            line=instr["line"],
+                        )
+
+    return graph
+
+
+def format_call_graph_ascii(graph, root=None, max_depth=None, use_color=True):
+    """Format call graph as ASCII tree."""
+    lines = []
+    lines.append(Colors.colorize("=== Call Graph ===", Colors.BOLD + Colors.CYAN, use_color))
+    lines.append("")
+
+    if root:
+        if root not in graph.nodes:
+            lines.append(Colors.colorize(f"Error: Root function '{root}' not found", Colors.RED, use_color))
+            return "\n".join(lines)
+        display_nodes = graph.get_reachable_subgraph(root)
+        start_nodes = [root]
+    else:
+        display_nodes = set(graph.node_names)
+        start_nodes = [
+            n for n in graph.node_names
+            if graph.nodes[n]["in_degree"] == 0 or n.startswith("<module>")
+        ]
+        if not start_nodes:
+            start_nodes = [graph.node_names[0]]
+
+    displayed_edges = graph.get_edges_for_subgraph(display_nodes)
+
+    def print_tree(node, prefix="", is_last=True, depth=0, visited=None):
+        if visited is None:
+            visited = set()
+
+        if max_depth is not None and depth > max_depth:
+            return
+
+        if node in visited:
+            connector = "└── " if is_last else "├── "
+            lines.append(f"{prefix}{connector}{Colors.colorize(node, Colors.DIM, use_color)} (already shown)")
+            return
+
+        visited.add(node)
+
+        connector = "└── " if is_last else "├── "
+        node_color = Colors.WHITE
+        if node.startswith("<module>"):
+            node_color = Colors.CYAN
+        elif any(call["callee"] == node for call in graph.nodes[node]["calls"]):
+            node_color = Colors.MAGENTA
+        elif graph.nodes[node]["in_degree"] == 0:
+            node_color = Colors.YELLOW
+
+        node_str = Colors.colorize(node, node_color + Colors.BOLD, use_color)
+        call_count = len(graph.nodes[node]["calls"])
+        called_by_count = len(graph.nodes[node]["called_by"])
+        suffix = Colors.colorize(
+            f" [calls: {call_count}, called by: {called_by_count}]",
+            Colors.DIM, use_color)
+        lines.append(f"{prefix}{connector}{node_str}{suffix}")
+
+        calls = sorted(graph.nodes[node]["calls"], key=lambda c: c["callee"])
+        for i, call in enumerate(calls):
+            if call["callee"] not in display_nodes:
+                continue
+            extension = "    " if is_last else "│   "
+            is_last_child = (i == len(calls) - 1)
+            print_tree(
+                call["callee"],
+                prefix + extension,
+                is_last_child,
+                depth + 1,
+                visited.copy()
+            )
+
+    for i, start in enumerate(start_nodes):
+        if start not in display_nodes:
+            continue
+        is_last_start = (i == len(start_nodes) - 1)
+        if i > 0:
+            lines.append("")
+        print_tree(start, "", is_last_start, 0, set())
+
+    recursion = graph.get_recursive_calls()
+    isolated = graph.get_isolated_functions()
+
+    if recursion["direct"]:
+        lines.append("")
+        lines.append(Colors.colorize("=== Direct Recursion ===", Colors.BOLD + Colors.MAGENTA, use_color))
+        for r in recursion["direct"]:
+            lines.append(f"  {Colors.colorize(r['function'], Colors.MAGENTA, use_color)} "
+                         f"calls itself at offset {r['offset']} (line {r['line']})")
+
+    if recursion["indirect"]:
+        lines.append("")
+        lines.append(Colors.colorize("=== Indirect Recursion Cycles ===", Colors.BOLD + Colors.MAGENTA, use_color))
+        for r in recursion["indirect"]:
+            cycle_str = " → ".join(
+                Colors.colorize(n, Colors.MAGENTA, use_color) for n in r["cycle"]
+            )
+            lines.append(f"  Cycle ({r['length']} nodes): {cycle_str}")
+
+    if isolated:
+        lines.append("")
+        lines.append(Colors.colorize("=== Isolated Functions (never called) ===", Colors.BOLD + Colors.YELLOW, use_color))
+        for iso in sorted(isolated):
+            lines.append(f"  {Colors.colorize(iso, Colors.YELLOW, use_color)}")
+
+    lines.append("")
+    lines.append(Colors.colorize("=== Legend ===", Colors.BOLD + Colors.DIM, use_color))
+    lines.append(f"  {Colors.colorize('Cyan', Colors.CYAN, use_color)}: Module entry point")
+    lines.append(f"  {Colors.colorize('Yellow', Colors.YELLOW, use_color)}: Isolated function (never called)")
+    lines.append(f"  {Colors.colorize('Magenta', Colors.MAGENTA, use_color)}: Recursive function")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def format_call_graph_dot(graph, root=None, output_path=None):
+    """Generate Graphviz DOT format call graph."""
+    lines = []
+    lines.append("digraph callgraph {")
+    lines.append('  node [shape=box, style="rounded,filled", fillcolor="#e8f4fd"];')
+    lines.append('  edge [fontsize=10, color="#666666"];')
+    lines.append("")
+
+    if root:
+        display_nodes = graph.get_reachable_subgraph(root)
+    else:
+        display_nodes = set(graph.node_names)
+
+    for name in sorted(display_nodes):
+        if name not in graph.nodes:
+            continue
+        node = graph.nodes[name]
+        label = f"{name}\\n"
+        label += f"calls: {node['out_degree']}\\n"
+        label += f"called by: {node['in_degree']}"
+        label = label.replace('"', "'")
+
+        fillcolor = "#e8f4fd"
+        if name.startswith("<module>"):
+            fillcolor = "#fffacd"
+        elif any(call["callee"] == name for call in node["calls"]):
+            fillcolor = "#ffe4e1"
+        elif node["in_degree"] == 0:
+            fillcolor = "#f0fff0"
+
+        safe_name = name.replace(".", "_").replace("<", "").replace(">", "").replace(" ", "_")
+        lines.append(f'  {safe_name} [label="{label}", fillcolor="{fillcolor}"];')
+
+    lines.append("")
+
+    edges_to_show = graph.get_edges_for_subgraph(display_nodes)
+    for edge in edges_to_show:
+        caller_safe = edge["caller"].replace(".", "_").replace("<", "").replace(">", "").replace(" ", "_")
+        callee_safe = edge["callee"].replace(".", "_").replace("<", "").replace(">", "").replace(" ", "_")
+        line_label = f"line {edge['line']}" if edge["line"] else ""
+        lines.append(f'  {caller_safe} -> {callee_safe} [label="{line_label}"];')
+
+    lines.append("}")
+
+    dot_content = "\n".join(lines)
+
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(dot_content)
+
+    return dot_content
+
+
+def cmd_callgraph(args):
+    """Handle 'callgraph' command."""
+    use_color = not args.no_color
+
+    try:
+        code_obj = compile_source(args.source)
+    except SyntaxError as e:
+        print(f"Error: Failed to compile {args.source}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    graph = build_call_graph(code_obj)
+
+    if not graph.nodes:
+        print(Colors.colorize("No functions found in the module.", Colors.YELLOW, use_color))
+        return
+
+    print(format_call_graph_ascii(graph, args.root, args.depth, use_color))
+
+    if args.dot:
+        format_call_graph_dot(graph, args.root, args.dot)
+        print(f"Graphviz DOT file written to: {args.dot}")
+        print()
+
+    if args.json:
+        recursion = graph.get_recursive_calls()
+        isolated = graph.get_isolated_functions()
+
+        nodes_data = []
+        for name in sorted(graph.node_names):
+            node = graph.nodes[name]
+            nodes_data.append({
+                "name": name,
+                "in_degree": node["in_degree"],
+                "out_degree": node["out_degree"],
+                "calls": node["calls"],
+                "called_by": [c["caller"] for c in node["called_by"]],
+            })
+
+        json_data = {
+            "nodes": nodes_data,
+            "edges": graph.edges,
+            "recursion": recursion,
+            "isolated_functions": isolated,
+        }
+
+        if args.root:
+            reachable = list(graph.get_reachable_subgraph(args.root))
+            json_data["root"] = args.root
+            json_data["reachable_from_root"] = reachable
+
+        with open(args.json, "w", encoding="utf-8") as f:
+            json.dump(json_data, f, indent=2, default=str)
+        print(f"JSON report written to: {args.json}")
 
 
 # ========== Diff Function ==========
@@ -1357,22 +2529,25 @@ def cmd_disasm(args):
 
         optimizations = None
         if args.optimize:
-            optimizations = analyze_optimizations(blocks, edges, instructions, co)
+            df_res = dataflow_results if dataflow_results else analyze_dataflow(blocks, edges, co)
+            optimizations = analyze_optimizations(blocks, edges, instructions, co, df_res)
             print(format_optimizations(optimizations, use_color))
 
         if args.json:
+            df_res = dataflow_results if dataflow_results else analyze_dataflow(blocks, edges, co)
             json_data = build_json_output(
                 name, co, instructions, blocks, edges,
-                dataflow_results if dataflow_results else analyze_dataflow(blocks, edges, co),
-                optimizations if optimizations else analyze_optimizations(blocks, edges, instructions, co)
+                df_res,
+                optimizations if optimizations else analyze_optimizations(blocks, edges, instructions, co, df_res)
             )
             all_data.append(json_data)
 
         if args.html:
+            df_res = dataflow_results if dataflow_results else analyze_dataflow(blocks, edges, co)
             json_data = build_json_output(
                 name, co, instructions, blocks, edges,
-                dataflow_results if dataflow_results else analyze_dataflow(blocks, edges, co),
-                optimizations if optimizations else analyze_optimizations(blocks, edges, instructions, co)
+                df_res,
+                optimizations if optimizations else analyze_optimizations(blocks, edges, instructions, co, df_res)
             )
             all_data.append(json_data)
 
@@ -1468,12 +2643,39 @@ def main():
     diff_parser.add_argument("--json", help="Export diff to JSON file")
     diff_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
 
+    rewrite_parser = subparsers.add_parser("rewrite", help="Auto-rewrite source code with optimizations")
+    rewrite_parser.add_argument("source", help="Path to .py source file")
+    rewrite_parser.add_argument("--output", "-o", help="Output file path (default: <source>_optimized.py)")
+    rewrite_parser.add_argument("--function", "-f", help="Optimize specific function only")
+    rewrite_parser.add_argument("--json", help="Export rewrite report to JSON file")
+    rewrite_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+
+    complexity_parser = subparsers.add_parser("complexity", help="Analyze function complexity and loops")
+    complexity_parser.add_argument("source", help="Path to .py source file")
+    complexity_parser.add_argument("--function", "-f", help="Analyze specific function only")
+    complexity_parser.add_argument("--json", help="Export complexity report to JSON file")
+    complexity_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+
+    callgraph_parser = subparsers.add_parser("callgraph", help="Generate function call graph")
+    callgraph_parser.add_argument("source", help="Path to .py source file")
+    callgraph_parser.add_argument("--root", "-r", help="Start from specific root function")
+    callgraph_parser.add_argument("--depth", "-d", type=int, help="Maximum display depth")
+    callgraph_parser.add_argument("--dot", help="Output Graphviz DOT file")
+    callgraph_parser.add_argument("--json", help="Export call graph to JSON file")
+    callgraph_parser.add_argument("--no-color", action="store_true", help="Disable colored output")
+
     args = parser.parse_args()
 
     if args.command == "disasm":
         cmd_disasm(args)
     elif args.command == "diff":
         cmd_diff(args)
+    elif args.command == "rewrite":
+        cmd_rewrite(args)
+    elif args.command == "complexity":
+        cmd_complexity(args)
+    elif args.command == "callgraph":
+        cmd_callgraph(args)
     else:
         parser.print_help()
 
